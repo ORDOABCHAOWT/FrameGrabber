@@ -1,0 +1,968 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>FrameGrabber</title>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #0a0a0f;
+  --surface: rgba(255,255,255,0.04);
+  --surface-hover: rgba(255,255,255,0.07);
+  --border: rgba(255,255,255,0.08);
+  --border-light: rgba(255,255,255,0.12);
+  --border-accent: rgba(124,107,245,0.4);
+  --text: #e8e8ed;
+  --text-dim: rgba(255,255,255,0.45);
+  --text-muted: rgba(255,255,255,0.25);
+  --accent: #7c6bf5;
+  --accent-glow: rgba(124,107,245,0.3);
+  --green: #34d399;
+  --green-glow: rgba(52,211,153,0.25);
+  --radius-sm: 10px;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  overflow: hidden;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+}
+
+body::before {
+  content: '';
+  position: fixed;
+  top: -40%; left: -20%;
+  width: 80%; height: 80%;
+  background: radial-gradient(ellipse, rgba(124,107,245,0.08) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+body::after {
+  content: '';
+  position: fixed;
+  bottom: -30%; right: -10%;
+  width: 60%; height: 60%;
+  background: radial-gradient(ellipse, rgba(52,211,153,0.05) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.app {
+  position: relative;
+  z-index: 1;
+  display: grid;
+  grid-template-columns: 1fr 300px;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+}
+
+/* ── Header ───────────────────────────────────── */
+.header {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  padding: 12px 24px;
+  border-bottom: 1px solid var(--border);
+  backdrop-filter: blur(40px);
+  -webkit-backdrop-filter: blur(40px);
+  background: rgba(10,10,15,0.7);
+}
+
+.logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-right: 24px;
+}
+
+.logo-icon {
+  width: 30px; height: 30px;
+  border-radius: 8px;
+  background: linear-gradient(135deg, var(--accent), #a78bfa);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px;
+  box-shadow: 0 0 20px var(--accent-glow);
+}
+
+.logo-text { font-size: 14px; font-weight: 600; letter-spacing: -0.3px; }
+
+.header-info { flex: 1; display: flex; align-items: center; gap: 16px; }
+
+.file-name {
+  font-size: 13px; color: var(--text-dim);
+  max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+.header-badges { display: flex; gap: 8px; }
+
+.badge {
+  display: none; align-items: center; gap: 5px;
+  padding: 4px 10px; border-radius: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  font-size: 11px; color: var(--text-dim); font-variant-numeric: tabular-nums;
+}
+
+.badge.visible { display: flex; }
+
+.badge-label {
+  color: var(--text-muted); text-transform: uppercase;
+  font-size: 9px; letter-spacing: 0.5px;
+}
+
+/* ── Preview ──────────────────────────────────── */
+.preview-area {
+  position: relative; overflow: hidden;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.3);
+}
+
+.preview-area img {
+  max-width: 100%; max-height: 100%;
+  object-fit: contain; opacity: 0;
+  transition: opacity 0.15s;
+}
+
+.preview-area img.loaded { opacity: 1; }
+
+.drop-zone {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  gap: 20px; transition: opacity 0.3s; z-index: 5;
+}
+
+.drop-zone.hidden { opacity: 0; pointer-events: none; }
+
+.drop-icon {
+  width: 80px; height: 80px; border-radius: 22px;
+  border: 2px dashed rgba(255,255,255,0.12);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 30px; color: var(--text-muted); transition: all 0.3s;
+}
+
+.drop-zone.drag-over .drop-icon {
+  border-color: var(--accent); color: var(--accent);
+  background: rgba(124,107,245,0.08); transform: scale(1.05);
+}
+
+.drop-text { font-size: 15px; color: var(--text-dim); text-align: center; line-height: 1.6; }
+.drop-sub { font-size: 12px; color: var(--text-muted); }
+
+.drop-btn {
+  display: flex; align-items: center; gap: 8px;
+  padding: 10px 28px; border: 1px solid var(--border-light);
+  border-radius: 12px; background: var(--surface-hover);
+  color: var(--text); font-size: 14px; font-weight: 500;
+  cursor: pointer; transition: all 0.2s; font-family: inherit; margin-top: 4px;
+}
+
+.drop-btn:hover {
+  background: var(--accent); border-color: var(--accent);
+  box-shadow: 0 0 24px var(--accent-glow);
+}
+
+/* ── Drag overlay ─────────────────────────────── */
+.drag-overlay {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(10,10,15,0.85);
+  backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+  z-index: 10; opacity: 0; pointer-events: none; transition: opacity 0.2s;
+}
+
+.drag-overlay.visible { opacity: 1; pointer-events: auto; }
+
+.drag-overlay-content { display: flex; flex-direction: column; align-items: center; gap: 12px; }
+
+.drag-overlay-icon {
+  width: 64px; height: 64px; border-radius: 18px;
+  border: 2px dashed var(--accent);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 26px; color: var(--accent); background: rgba(124,107,245,0.1);
+}
+
+.drag-overlay-text { font-size: 15px; color: var(--text-dim); }
+
+/* ── Progress bar ─────────────────────────────── */
+.import-progress {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  z-index: 20; padding: 16px 24px;
+  background: rgba(10,10,15,0.9);
+  backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  border-top: 1px solid var(--border);
+  transform: translateY(100%); opacity: 0;
+  transition: all 0.3s;
+}
+
+.import-progress.visible { transform: translateY(0); opacity: 1; }
+
+.import-progress-label {
+  font-size: 12px; color: var(--text-dim); margin-bottom: 8px;
+  display: flex; justify-content: space-between;
+}
+
+.import-progress-track {
+  width: 100%; height: 4px;
+  background: rgba(255,255,255,0.08); border-radius: 2px; overflow: hidden;
+}
+
+.import-progress-fill {
+  height: 100%; border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent), #a78bfa);
+  transition: width 0.3s;
+  width: 0%;
+}
+
+/* ── Side Panel ───────────────────────────────── */
+.side-panel {
+  border-left: 1px solid var(--border);
+  background: rgba(10,10,15,0.6);
+  backdrop-filter: blur(40px); -webkit-backdrop-filter: blur(40px);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+
+.panel-section { padding: 16px; border-bottom: 1px solid var(--border); }
+.panel-section:last-child { border-bottom: none; }
+
+.panel-title {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: 1px; color: var(--text-muted); margin-bottom: 12px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+
+.panel-title-action {
+  font-size: 11px; font-weight: 400; text-transform: none;
+  letter-spacing: 0; color: var(--accent); cursor: pointer; transition: opacity 0.2s;
+}
+
+.panel-title-action:hover { opacity: 0.7; }
+
+/* ── Video List ───────────────────────────────── */
+.video-list-section { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+
+.video-list { flex: 1; overflow-y: auto; padding: 0 16px 16px; }
+
+.video-list::-webkit-scrollbar { width: 4px; }
+.video-list::-webkit-scrollbar-track { background: transparent; }
+.video-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+.video-item {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border: 1px solid var(--border);
+  border-radius: var(--radius-sm); background: var(--surface);
+  cursor: pointer; transition: all 0.15s;
+  margin-bottom: 6px; position: relative;
+}
+
+.video-item:hover { background: var(--surface-hover); border-color: var(--border-light); }
+.video-item.active { border-color: var(--border-accent); background: rgba(124,107,245,0.08); }
+
+.video-thumb {
+  width: 56px; height: 36px; border-radius: 6px;
+  background: rgba(0,0,0,0.4); object-fit: cover; flex-shrink: 0;
+}
+
+.video-item-info { flex: 1; min-width: 0; }
+
+.video-item-name {
+  font-size: 12px; font-weight: 500; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.video-item-meta { font-size: 10px; color: var(--text-muted); margin-top: 2px; }
+
+.video-item-remove {
+  position: absolute; top: 4px; right: 6px;
+  width: 18px; height: 18px; border-radius: 50%;
+  background: transparent; border: none;
+  color: var(--text-muted); font-size: 12px;
+  cursor: pointer; display: flex; align-items: center; justify-content: center;
+  opacity: 0; transition: all 0.15s;
+}
+
+.video-item:hover .video-item-remove { opacity: 1; }
+.video-item-remove:hover { background: rgba(239,68,68,0.2); color: #ef4444; }
+
+.video-list-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  padding: 24px 16px; color: var(--text-muted);
+  font-size: 12px; text-align: center; line-height: 1.6;
+}
+
+/* ── Info Cards ───────────────────────────────── */
+.info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+
+.info-card {
+  padding: 8px 10px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+
+.info-card.full { grid-column: 1 / -1; }
+
+.info-label {
+  font-size: 9px; text-transform: uppercase;
+  letter-spacing: 0.8px; color: var(--text-muted); margin-bottom: 3px;
+}
+
+.info-value {
+  font-size: 15px; font-weight: 600;
+  letter-spacing: -0.3px; font-variant-numeric: tabular-nums;
+}
+
+.info-value.small { font-size: 12px; font-weight: 500; }
+
+/* ── Grab Section ─────────────────────────────── */
+.grab-section { padding: 16px; border-top: 1px solid var(--border); margin-top: auto; }
+
+.grab-btn {
+  width: 100%; padding: 12px; border: none;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, var(--green), #2dd4a0);
+  color: #0a0a0f; font-size: 13px; font-weight: 600;
+  cursor: pointer; transition: all 0.2s;
+  font-family: inherit; letter-spacing: -0.2px;
+}
+
+.grab-btn:hover { box-shadow: 0 0 30px var(--green-glow); transform: translateY(-1px); }
+.grab-btn:active { transform: translateY(0); }
+.grab-btn:disabled { opacity: 0.3; cursor: not-allowed; transform: none; box-shadow: none; }
+
+.save-path {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: 8px; padding: 7px 10px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; font-size: 11px; color: var(--text-muted);
+  cursor: pointer; transition: all 0.2s;
+}
+
+.save-path:hover { border-color: var(--border-light); color: var(--text-dim); }
+
+.grab-count {
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 10px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px;
+  font-size: 11px; color: var(--text-dim); margin-top: 8px;
+}
+
+.grab-count-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--green); box-shadow: 0 0 8px var(--green-glow);
+}
+
+/* ── Toast ────────────────────────────────────── */
+.toast {
+  position: fixed; top: 20px; right: 20px;
+  padding: 12px 20px; border-radius: var(--radius-sm);
+  background: rgba(52,211,153,0.15); border: 1px solid rgba(52,211,153,0.3);
+  color: var(--green); font-size: 13px; font-weight: 500;
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+  transform: translateY(-20px); opacity: 0;
+  transition: all 0.3s; z-index: 100; pointer-events: none; max-width: 400px;
+}
+
+.toast.show { transform: translateY(0); opacity: 1; }
+
+/* ── Bottom Bar ───────────────────────────────── */
+.bottom-bar {
+  grid-column: 1 / -1;
+  padding: 0 24px 14px;
+  border-top: 1px solid var(--border);
+  background: rgba(10,10,15,0.8);
+  backdrop-filter: blur(40px); -webkit-backdrop-filter: blur(40px);
+}
+
+.timeline { padding: 14px 0 8px; }
+
+.timeline-track {
+  position: relative; width: 100%; height: 6px;
+  background: rgba(255,255,255,0.08); border-radius: 3px;
+  cursor: pointer; transition: height 0.15s;
+}
+
+.timeline-track:hover { height: 10px; }
+
+.timeline-fill {
+  position: absolute; left: 0; top: 0; height: 100%;
+  background: linear-gradient(90deg, var(--accent), #a78bfa);
+  border-radius: 3px; pointer-events: none;
+}
+
+.timeline-thumb {
+  position: absolute; top: 50%;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: white; border: 2px solid var(--accent);
+  transform: translate(-50%, -50%);
+  cursor: grab; box-shadow: 0 0 12px var(--accent-glow);
+  transition: transform 0.1s; z-index: 2;
+}
+
+.timeline-thumb:hover { transform: translate(-50%, -50%) scale(1.2); }
+
+.timeline-hover-preview {
+  position: absolute; bottom: 24px; transform: translateX(-50%);
+  padding: 4px 10px; background: rgba(0,0,0,0.85);
+  border: 1px solid var(--border); border-radius: 6px;
+  font-size: 11px; color: var(--text); font-variant-numeric: tabular-nums;
+  pointer-events: none; opacity: 0; transition: opacity 0.15s;
+  white-space: nowrap; z-index: 3;
+}
+
+.timeline-track:hover .timeline-hover-preview { opacity: 1; }
+
+.controls-row { display: flex; align-items: center; justify-content: space-between; }
+
+.time-display { display: flex; align-items: baseline; gap: 6px; font-variant-numeric: tabular-nums; }
+.time-current { font-size: 20px; font-weight: 600; letter-spacing: -0.5px; }
+.time-sep { color: var(--text-muted); font-size: 13px; }
+.time-total { font-size: 13px; color: var(--text-dim); }
+
+.shortcuts { font-size: 11px; color: var(--text-muted); display: flex; gap: 14px; }
+
+.shortcut-key {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 20px; padding: 0 5px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 4px; font-size: 10px; color: var(--text-dim); margin-right: 4px;
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">▶</div>
+      <span class="logo-text">FrameGrabber</span>
+    </div>
+    <div class="header-info">
+      <span class="file-name" id="fileName"></span>
+      <div class="header-badges">
+        <div class="badge" id="badgeRes"><span class="badge-label">RES</span><span id="badgeResVal">—</span></div>
+        <div class="badge" id="badgeFps"><span class="badge-label">FPS</span><span id="badgeFpsVal">—</span></div>
+        <div class="badge" id="badgeCodec"><span class="badge-label">CODEC</span><span id="badgeCodecVal">—</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="preview-area" id="previewArea">
+    <div class="drop-zone" id="dropZone">
+      <div class="drop-icon">◇</div>
+      <div class="drop-text">拖入视频文件到此处</div>
+      <div class="drop-sub">支持 MP4 / MOV / MKV / AVI / WebM / ProRes</div>
+      <button class="drop-btn" onclick="chooseFile()">打开视频</button>
+    </div>
+    <img id="previewImg" src="" alt="">
+    <div class="drag-overlay" id="dragOverlay">
+      <div class="drag-overlay-content">
+        <div class="drag-overlay-icon">+</div>
+        <div class="drag-overlay-text">释放以添加视频</div>
+      </div>
+    </div>
+    <div class="import-progress" id="importProgress">
+      <div class="import-progress-label">
+        <span id="importLabel">正在导入...</span>
+        <span id="importPct">0%</span>
+      </div>
+      <div class="import-progress-track">
+        <div class="import-progress-fill" id="importFill"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="side-panel">
+    <div class="panel-section" id="infoSection" style="display:none;">
+      <div class="panel-title">当前视频</div>
+      <div class="info-grid">
+        <div class="info-card">
+          <div class="info-label">分辨率</div>
+          <div class="info-value small" id="infoRes">—</div>
+        </div>
+        <div class="info-card">
+          <div class="info-label">帧率</div>
+          <div class="info-value small" id="infoFps">—</div>
+        </div>
+        <div class="info-card">
+          <div class="info-label">编码</div>
+          <div class="info-value small" id="infoCodec">—</div>
+        </div>
+        <div class="info-card">
+          <div class="info-label">时长</div>
+          <div class="info-value small" id="infoDuration">—</div>
+        </div>
+        <div class="info-card full">
+          <div class="info-label">时间码</div>
+          <div class="info-value" id="infoTimecode" style="font-size:17px;">00:00:00.000</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel-section video-list-section">
+      <div class="panel-title" style="padding: 0 16px; padding-top: 0;">
+        <span>视频列表</span>
+        <span class="panel-title-action" onclick="chooseFile()">+ 添加</span>
+      </div>
+      <div class="video-list" id="videoList">
+        <div class="video-list-empty" id="videoListEmpty">
+          拖入或打开视频文件<br>支持同时导入多个视频
+        </div>
+      </div>
+    </div>
+
+    <div class="grab-section">
+      <button class="grab-btn" id="grabBtn" onclick="grabFrame()" disabled>截取当前帧 (PNG)</button>
+      <div class="save-path" onclick="chooseSaveDir()">
+        <span>保存到</span>
+        <span id="saveDir">桌面</span>
+      </div>
+      <div class="grab-count" id="grabCount" style="display:none;">
+        <div class="grab-count-dot"></div>
+        <span id="grabCountText">已截取 0 帧</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="bottom-bar">
+    <div class="timeline">
+      <div class="timeline-track" id="timeline">
+        <div class="timeline-fill" id="timelineFill"></div>
+        <div class="timeline-thumb" id="timelineThumb" style="left:0%"></div>
+        <div class="timeline-hover-preview" id="timelineHover">00:00:00.000</div>
+      </div>
+    </div>
+    <div class="controls-row">
+      <div class="time-display">
+        <span class="time-current" id="timeCurrent">00:00:00.000</span>
+        <span class="time-sep">/</span>
+        <span class="time-total" id="timeTotal">00:00:00.000</span>
+      </div>
+      <div class="shortcuts">
+        <span><span class="shortcut-key">←</span><span class="shortcut-key">→</span> 逐帧</span>
+        <span><span class="shortcut-key">Space</span> 截取</span>
+        <span><span class="shortcut-key">⌘O</span> 打开</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ── State ──────────────────────────────────────
+let videos = {};
+let activeId = null;
+let currentTime = 0;
+let seekDebounce = null;
+let isDragging = false;
+let bodyDragCounter = 0;
+let pendingFrameLoad = null; // abort controller for cancelling stale frame loads
+let frameLoadId = 0;         // monotonic id to discard stale responses
+
+const $ = id => document.getElementById(id);
+const previewImg = $('previewImg');
+const dropZone = $('dropZone');
+const dragOverlay = $('dragOverlay');
+const timeline = $('timeline');
+const timelineFill = $('timelineFill');
+const timelineThumb = $('timelineThumb');
+const timelineHover = $('timelineHover');
+
+function formatTime(sec) {
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  const ms = Math.floor((sec % 1) * 1000);
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}.${String(ms).padStart(3,'0')}`;
+}
+
+function activeVideo() {
+  return activeId !== null ? videos[activeId] : null;
+}
+
+// ── Import Progress ────────────────────────────
+function showProgress(label, pct) {
+  const el = $('importProgress');
+  $('importLabel').textContent = label;
+  $('importPct').textContent = Math.round(pct) + '%';
+  $('importFill').style.width = pct + '%';
+  el.classList.add('visible');
+}
+
+function hideProgress() {
+  $('importProgress').classList.remove('visible');
+}
+
+// ── File Handling ──────────────────────────────
+async function chooseFile() {
+  const res = await fetch('/api/choose', { method: 'POST' });
+  const data = await res.json();
+  if (data.paths && data.paths.length > 0) {
+    await addVideosByPath(data.paths);
+  }
+}
+
+async function addVideosByPath(paths) {
+  const total = paths.length;
+  showProgress(`正在导入 0/${total}...`, 0);
+
+  // Add one by one so we can show progress
+  let added = [];
+  for (let i = 0; i < paths.length; i++) {
+    showProgress(`正在导入 ${i+1}/${total}...`, ((i) / total) * 100);
+    try {
+      const res = await fetch('/api/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paths: [paths[i]] })
+      });
+      const data = await res.json();
+      if (data.added) {
+        for (const v of data.added) {
+          videos[v.id] = v;
+          added.push(v);
+        }
+        if (data.active !== null && activeId === null) {
+          activeId = data.active;
+        }
+      }
+    } catch (e) { /* skip failed */ }
+    showProgress(`正在导入 ${i+1}/${total}...`, ((i+1) / total) * 100);
+  }
+
+  hideProgress();
+
+  if (added.length > 0) {
+    await selectVideo(activeId || added[0].id);
+    renderVideoList();
+    showToast(`已添加 ${added.length} 个视频`);
+  }
+}
+
+async function selectVideo(id) {
+  const res = await fetch('/api/select', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id })
+  });
+  const data = await res.json();
+  if (data.error) return;
+
+  activeId = id;
+  const v = videos[id];
+  currentTime = 0;
+
+  $('fileName').textContent = v.filename;
+  $('badgeRes').classList.add('visible');
+  $('badgeResVal').textContent = `${v.width}×${v.height}`;
+  $('badgeFps').classList.add('visible');
+  $('badgeFpsVal').textContent = v.fps;
+  $('badgeCodec').classList.add('visible');
+  $('badgeCodecVal').textContent = v.codec.toUpperCase();
+
+  $('infoSection').style.display = '';
+  $('infoRes').textContent = `${v.width}×${v.height}`;
+  $('infoFps').textContent = `${v.fps} fps`;
+  $('infoCodec').textContent = v.codec.toUpperCase();
+  $('infoDuration').textContent = formatTime(v.duration);
+  $('timeTotal').textContent = formatTime(v.duration);
+  $('grabBtn').disabled = false;
+
+  dropZone.classList.add('hidden');
+  renderVideoList();
+  seekTo(0);
+}
+
+async function removeVideo(id, e) {
+  if (e) e.stopPropagation();
+  const res = await fetch('/api/remove', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id })
+  });
+  const data = await res.json();
+  delete videos[id];
+  activeId = data.active;
+
+  if (activeId !== null) {
+    await selectVideo(activeId);
+  } else {
+    resetUI();
+  }
+  renderVideoList();
+}
+
+function resetUI() {
+  $('fileName').textContent = '';
+  ['badgeRes','badgeFps','badgeCodec'].forEach(b => $(b).classList.remove('visible'));
+  $('infoSection').style.display = 'none';
+  $('timeTotal').textContent = '00:00:00.000';
+  $('timeCurrent').textContent = '00:00:00.000';
+  $('infoTimecode').textContent = '00:00:00.000';
+  timelineFill.style.width = '0%';
+  timelineThumb.style.left = '0%';
+  previewImg.classList.remove('loaded');
+  previewImg.src = '';
+  $('grabBtn').disabled = true;
+  dropZone.classList.remove('hidden');
+}
+
+// ── Video List ─────────────────────────────────
+function renderVideoList() {
+  const list = $('videoList');
+  const empty = $('videoListEmpty');
+  const ids = Object.keys(videos);
+
+  if (ids.length === 0) {
+    list.innerHTML = '';
+    list.appendChild(empty);
+    empty.style.display = '';
+    return;
+  }
+
+  empty.style.display = 'none';
+  let html = '';
+  for (const id of ids) {
+    const v = videos[id];
+    const isActive = parseInt(id) === activeId;
+    html += `
+      <div class="video-item ${isActive ? 'active' : ''}" onclick="selectVideo(${id})">
+        <img class="video-thumb" src="/api/thumbnail?vid=${id}" alt="" loading="lazy">
+        <div class="video-item-info">
+          <div class="video-item-name" title="${v.filename}">${v.filename}</div>
+          <div class="video-item-meta">${v.width}×${v.height} · ${formatTime(v.duration)}</div>
+        </div>
+        <button class="video-item-remove" onclick="removeVideo(${id}, event)" title="移除">✕</button>
+      </div>`;
+  }
+  list.innerHTML = html;
+  list.appendChild(empty);
+}
+
+// ── Timeline ───────────────────────────────────
+function seekTo(t) {
+  const v = activeVideo();
+  if (!v) return;
+  t = Math.max(0, Math.min(t, v.duration));
+  currentTime = t;
+
+  const pct = v.duration > 0 ? (t / v.duration) * 100 : 0;
+  timelineFill.style.width = pct + '%';
+  timelineThumb.style.left = pct + '%';
+
+  $('timeCurrent').textContent = formatTime(t);
+  $('infoTimecode').textContent = formatTime(t);
+
+  // Cancel any pending frame load
+  clearTimeout(seekDebounce);
+  const loadId = ++frameLoadId;
+
+  seekDebounce = setTimeout(() => {
+    const url = `/api/frame?vid=${activeId}&t=${t.toFixed(3)}&_=${loadId}`;
+    const tmp = new Image();
+    tmp.onload = () => {
+      if (loadId !== frameLoadId) return; // stale
+      previewImg.src = tmp.src;
+      previewImg.classList.add('loaded');
+    };
+    tmp.src = url;
+  }, isDragging ? 100 : 30); // longer debounce while scrubbing
+}
+
+function stepFrame(dir) {
+  const v = activeVideo();
+  if (!v) return;
+  seekTo(currentTime + dir / v.fps);
+}
+
+function getTimeFromEvent(e) {
+  const v = activeVideo();
+  const rect = timeline.getBoundingClientRect();
+  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  return pct * (v ? v.duration : 0);
+}
+
+timeline.addEventListener('mousedown', e => {
+  if (!activeVideo()) return;
+  isDragging = true;
+  seekTo(getTimeFromEvent(e));
+});
+
+document.addEventListener('mousemove', e => {
+  if (isDragging && activeVideo()) {
+    seekTo(getTimeFromEvent(e));
+  }
+  if (activeVideo()) {
+    const rect = timeline.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    if (x >= 0 && x <= rect.width) {
+      timelineHover.textContent = formatTime((x / rect.width) * activeVideo().duration);
+      timelineHover.style.left = x + 'px';
+    }
+  }
+});
+
+document.addEventListener('mouseup', () => { isDragging = false; });
+
+// ── Grab ───────────────────────────────────────
+async function grabFrame() {
+  if (!activeVideo()) return;
+  $('grabBtn').disabled = true;
+  $('grabBtn').textContent = '截取中...';
+
+  try {
+    const res = await fetch('/api/grab', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ vid: activeId, time: currentTime })
+    });
+    const data = await res.json();
+    if (data.error) {
+      showToast(data.error, true);
+    } else {
+      showToast(`已保存 ${data.filename} (${data.size_kb} KB)`);
+      $('grabCount').style.display = 'flex';
+      $('grabCountText').textContent = `已截取 ${data.count} 帧`;
+    }
+  } catch (e) {
+    showToast('截取失败', true);
+  }
+
+  $('grabBtn').disabled = false;
+  $('grabBtn').textContent = '截取当前帧 (PNG)';
+}
+
+async function chooseSaveDir() {
+  const res = await fetch('/api/choose_dir', { method: 'POST' });
+  const data = await res.json();
+  if (data.dir) $('saveDir').textContent = data.name || data.dir;
+}
+
+// ── Toast ──────────────────────────────────────
+let toastTimer = null;
+function showToast(msg, isError) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.style.background = isError ? 'rgba(239,68,68,0.15)' : 'rgba(52,211,153,0.15)';
+  t.style.borderColor = isError ? 'rgba(239,68,68,0.3)' : 'rgba(52,211,153,0.3)';
+  t.style.color = isError ? '#ef4444' : '#34d399';
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2500);
+}
+
+// ── Keyboard ───────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft') { e.preventDefault(); stepFrame(-1); }
+  if (e.key === 'ArrowRight') { e.preventDefault(); stepFrame(1); }
+  if (e.key === ' ') { e.preventDefault(); grabFrame(); }
+  if ((e.metaKey || e.ctrlKey) && e.key === 'o') { e.preventDefault(); chooseFile(); }
+});
+
+// ── Drag & Drop ────────────────────────────────
+// Strategy: try to resolve file paths first (fast, no upload needed).
+// Fall back to upload only if resolve fails.
+
+function hasVideoFiles(dt) {
+  return dt.types.includes('Files');
+}
+
+document.addEventListener('dragenter', e => {
+  e.preventDefault();
+  bodyDragCounter++;
+  if (hasVideoFiles(e.dataTransfer)) {
+    if (activeId !== null) {
+      dragOverlay.classList.add('visible');
+    } else {
+      dropZone.classList.add('drag-over');
+    }
+  }
+});
+
+document.addEventListener('dragleave', e => {
+  e.preventDefault();
+  bodyDragCounter--;
+  if (bodyDragCounter <= 0) {
+    bodyDragCounter = 0;
+    dragOverlay.classList.remove('visible');
+    dropZone.classList.remove('drag-over');
+  }
+});
+
+document.addEventListener('dragover', e => {
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'copy';
+});
+
+document.addEventListener('drop', async e => {
+  e.preventDefault();
+  bodyDragCounter = 0;
+  dragOverlay.classList.remove('visible');
+  dropZone.classList.remove('drag-over');
+
+  const files = e.dataTransfer.files;
+  if (!files || files.length === 0) return;
+
+  const videoExts = /\.(mp4|mov|mkv|avi|webm|m4v|flv|ts|mxf|prores)$/i;
+  const videoFiles = [];
+  for (const f of files) {
+    if (f.type.startsWith('video/') || videoExts.test(f.name)) {
+      videoFiles.push(f);
+    }
+  }
+
+  if (videoFiles.length === 0) {
+    showToast('没有识别到视频文件', true);
+    return;
+  }
+
+  // Use Spotlight (mdfind) to resolve real file paths — no upload, no copy
+  const names = videoFiles.map(f => f.name);
+  const sizes = videoFiles.map(f => f.size);
+  showProgress(`正在定位文件...`, 30);
+
+  try {
+    const res = await fetch('/api/resolve_paths', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names, sizes })
+    });
+    const data = await res.json();
+
+    if (data.paths && data.paths.length > 0) {
+      hideProgress();
+      await addVideosByPath(data.paths);
+      return;
+    }
+  } catch (err) { /* fall through */ }
+
+  // Fallback: ask user to pick files via native dialog (no upload needed)
+  hideProgress();
+  showToast('无法自动定位文件，请手动选择', false);
+
+  try {
+    const res = await fetch('/api/choose_for_drop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count: videoFiles.length })
+    });
+    const data = await res.json();
+    if (data.paths && data.paths.length > 0) {
+      await addVideosByPath(data.paths);
+    }
+  } catch (err) {
+    showToast('导入失败', true);
+  }
+});
+
+// ── Init ───────────────────────────────────────
+fetch('/api/state').then(r => r.json()).then(d => {
+  $('saveDir').textContent = d.save_dir_name || '桌面';
+});
+</script>
+</body>
+</html>
