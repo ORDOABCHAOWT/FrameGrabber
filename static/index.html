@@ -422,6 +422,34 @@ body::after {
 .time-sep { color: var(--text-muted); font-size: 13px; }
 .time-total { font-size: 13px; color: var(--text-dim); }
 
+.transport-controls {
+  display: flex; align-items: center; gap: 10px;
+  margin-left: 18px; flex: 1;
+}
+
+.transport-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 100px; height: 36px; padding: 0 14px;
+  border: 1px solid var(--border-light); border-radius: 999px;
+  background: var(--surface-hover); color: var(--text);
+  font-size: 12px; font-weight: 600; letter-spacing: -0.2px;
+  cursor: pointer; transition: all 0.2s; font-family: inherit;
+}
+
+.transport-btn:hover:not(:disabled) {
+  border-color: var(--accent); box-shadow: 0 0 18px var(--accent-glow);
+}
+
+.transport-btn:disabled {
+  opacity: 0.35; cursor: not-allowed; box-shadow: none;
+}
+
+.play-status {
+  font-size: 11px; color: var(--text-dim);
+  padding: 6px 10px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface);
+}
+
 .shortcuts { font-size: 11px; color: var(--text-muted); display: flex; gap: 14px; }
 
 .shortcut-key {
@@ -535,15 +563,20 @@ body::after {
         <div class="timeline-hover-preview" id="timelineHover">00:00:00.000</div>
       </div>
     </div>
-    <div class="controls-row">
+      <div class="controls-row">
       <div class="time-display">
         <span class="time-current" id="timeCurrent">00:00:00.000</span>
         <span class="time-sep">/</span>
         <span class="time-total" id="timeTotal">00:00:00.000</span>
       </div>
+      <div class="transport-controls">
+        <button class="transport-btn" id="playBtn" onclick="togglePlayback()" disabled>播放预览</button>
+        <span class="play-status" id="playStatus">未载入</span>
+      </div>
       <div class="shortcuts">
         <span><span class="shortcut-key">←</span><span class="shortcut-key">→</span> 逐帧</span>
-        <span><span class="shortcut-key">Space</span> 截取</span>
+        <span><span class="shortcut-key">Space</span> 播放/暂停</span>
+        <span><span class="shortcut-key">Enter</span> 截取</span>
         <span><span class="shortcut-key">⌘O</span> 打开</span>
       </div>
     </div>
@@ -552,6 +585,7 @@ body::after {
 
 <div class="toast" id="toast"></div>
 
+<script src="/static/playback_scheduler.js"></script>
 <script>
 // ── State ──────────────────────────────────────
 let videos = {};
@@ -562,6 +596,14 @@ let isDragging = false;
 let bodyDragCounter = 0;
 let pendingFrameLoad = null; // abort controller for cancelling stale frame loads
 let frameLoadId = 0;         // monotonic id to discard stale responses
+let currentPreviewUrl = null;
+let heartbeatTimer = null;
+let isPlaying = false;
+let playbackTimer = null;
+let playbackStartedAt = 0;
+let playbackBaseTime = 0;
+const PLAYBACK_INTERVAL_MS = 100;
+let deferredPlaybackTime = null;
 
 const $ = id => document.getElementById(id);
 const previewImg = $('previewImg');
@@ -571,6 +613,7 @@ const timeline = $('timeline');
 const timelineFill = $('timelineFill');
 const timelineThumb = $('timelineThumb');
 const timelineHover = $('timelineHover');
+const { getPreviewRequestPlan } = window.FrameGrabberPlaybackScheduler;
 
 function formatTime(sec) {
   const h = Math.floor(sec / 3600);
@@ -581,7 +624,86 @@ function formatTime(sec) {
 }
 
 function activeVideo() {
-  return activeId !== null ? videos[activeId] : null;
+  return activeId !== null ? videos[String(activeId)] : null;
+}
+
+function revokePreviewUrl() {
+  if (currentPreviewUrl) {
+    URL.revokeObjectURL(currentPreviewUrl);
+    currentPreviewUrl = null;
+  }
+}
+
+function pingApp() {
+  fetch('/api/ping', {
+    method: 'POST',
+    keepalive: true
+  }).catch(() => {});
+}
+
+function startHeartbeat() {
+  pingApp();
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = setInterval(pingApp, 1500);
+}
+
+function updatePlaybackUI() {
+  const hasVideo = !!activeVideo();
+  $('playBtn').disabled = !hasVideo;
+  if (!hasVideo) {
+    $('playBtn').textContent = '播放预览';
+    $('playStatus').textContent = '未载入';
+    return;
+  }
+  $('playBtn').textContent = isPlaying ? '暂停预览' : '播放预览';
+  $('playStatus').textContent = isPlaying ? '播放中' : '已暂停';
+}
+
+function pausePlayback() {
+  if (playbackTimer) {
+    clearInterval(playbackTimer);
+    playbackTimer = null;
+  }
+  isPlaying = false;
+  deferredPlaybackTime = null;
+  updatePlaybackUI();
+}
+
+function playbackTick() {
+  const v = activeVideo();
+  if (!v) {
+    pausePlayback();
+    return;
+  }
+
+  const nextTime = playbackBaseTime + ((performance.now() - playbackStartedAt) / 1000);
+  if (nextTime >= v.duration) {
+    pausePlayback();
+    seekTo(v.duration, { fromPlayback: true });
+    return;
+  }
+  seekTo(nextTime, { fromPlayback: true });
+}
+
+function togglePlayback() {
+  const v = activeVideo();
+  if (!v) return;
+
+  if (isPlaying) {
+    pausePlayback();
+    return;
+  }
+
+  if (currentTime >= v.duration) {
+    currentTime = 0;
+  }
+
+  playbackBaseTime = currentTime;
+  playbackStartedAt = performance.now();
+  isPlaying = true;
+  updatePlaybackUI();
+  playbackTick();
+  playbackTimer = setInterval(playbackTick, PLAYBACK_INTERVAL_MS);
 }
 
 // ── Import Progress ────────────────────────────
@@ -599,51 +721,56 @@ function hideProgress() {
 
 // ── File Handling ──────────────────────────────
 async function chooseFile() {
-  const res = await fetch('/api/choose', { method: 'POST' });
-  const data = await res.json();
-  if (data.paths && data.paths.length > 0) {
-    await addVideosByPath(data.paths);
+  showToast('正在打开文件选择器...');
+  try {
+    const res = await fetch('/api/choose', { method: 'POST' });
+    const data = await res.json();
+    if (data.paths && data.paths.length > 0) {
+      await addVideosByPath(data.paths);
+    } else {
+      showToast('未选择文件', true);
+    }
+  } catch (e) {
+    showToast('打开失败: ' + e.message, true);
   }
 }
 
 async function addVideosByPath(paths) {
-  const total = paths.length;
-  showProgress(`正在导入 0/${total}...`, 0);
+  showProgress(`正在导入 ${paths.length} 个视频...`, 50);
 
-  // Add one by one so we can show progress
-  let added = [];
-  for (let i = 0; i < paths.length; i++) {
-    showProgress(`正在导入 ${i+1}/${total}...`, ((i) / total) * 100);
-    try {
-      const res = await fetch('/api/add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paths: [paths[i]] })
-      });
-      const data = await res.json();
-      if (data.added) {
-        for (const v of data.added) {
-          videos[v.id] = v;
-          added.push(v);
-        }
-        if (data.active !== null && activeId === null) {
-          activeId = data.active;
-        }
+  try {
+    const res = await fetch('/api/add', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths })
+    });
+    const data = await res.json();
+    hideProgress();
+
+    if (data.error) {
+      showToast('导入失败: ' + data.error, true);
+      return;
+    }
+
+    if (data.added && data.added.length > 0) {
+      for (const v of data.added) {
+        videos[String(v.id)] = v;
       }
-    } catch (e) { /* skip failed */ }
-    showProgress(`正在导入 ${i+1}/${total}...`, ((i+1) / total) * 100);
-  }
-
-  hideProgress();
-
-  if (added.length > 0) {
-    await selectVideo(activeId || added[0].id);
-    renderVideoList();
-    showToast(`已添加 ${added.length} 个视频`);
+      const selectId = data.active !== null ? data.active : data.added[0].id;
+      await selectVideo(selectId);
+      renderVideoList();
+      showToast(`已添加 ${data.added.length} 个视频`);
+    } else {
+      showToast('没有可导入的视频', true);
+    }
+  } catch (e) {
+    hideProgress();
+    showToast('导入失败: ' + e.message, true);
   }
 }
 
 async function selectVideo(id) {
+  id = Number(id);
   const res = await fetch('/api/select', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -652,8 +779,9 @@ async function selectVideo(id) {
   const data = await res.json();
   if (data.error) return;
 
+  pausePlayback();
   activeId = id;
-  const v = videos[id];
+  const v = videos[String(id)];
   currentTime = 0;
 
   $('fileName').textContent = v.filename;
@@ -671,6 +799,7 @@ async function selectVideo(id) {
   $('infoDuration').textContent = formatTime(v.duration);
   $('timeTotal').textContent = formatTime(v.duration);
   $('grabBtn').disabled = false;
+  updatePlaybackUI();
 
   dropZone.classList.add('hidden');
   renderVideoList();
@@ -679,14 +808,16 @@ async function selectVideo(id) {
 
 async function removeVideo(id, e) {
   if (e) e.stopPropagation();
+  id = Number(id);
   const res = await fetch('/api/remove', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ id })
   });
   const data = await res.json();
-  delete videos[id];
+  delete videos[String(id)];
   activeId = data.active;
+  pausePlayback();
 
   if (activeId !== null) {
     await selectVideo(activeId);
@@ -697,6 +828,11 @@ async function removeVideo(id, e) {
 }
 
 function resetUI() {
+  pausePlayback();
+  if (pendingFrameLoad) {
+    pendingFrameLoad.abort();
+    pendingFrameLoad = null;
+  }
   $('fileName').textContent = '';
   ['badgeRes','badgeFps','badgeCodec'].forEach(b => $(b).classList.remove('visible'));
   $('infoSection').style.display = 'none';
@@ -706,9 +842,11 @@ function resetUI() {
   timelineFill.style.width = '0%';
   timelineThumb.style.left = '0%';
   previewImg.classList.remove('loaded');
+  revokePreviewUrl();
   previewImg.src = '';
   $('grabBtn').disabled = true;
   dropZone.classList.remove('hidden');
+  updatePlaybackUI();
 }
 
 // ── Video List ─────────────────────────────────
@@ -725,28 +863,58 @@ function renderVideoList() {
   }
 
   empty.style.display = 'none';
-  let html = '';
+  list.innerHTML = '';
   for (const id of ids) {
     const v = videos[id];
-    const isActive = parseInt(id) === activeId;
-    html += `
-      <div class="video-item ${isActive ? 'active' : ''}" onclick="selectVideo(${id})">
-        <img class="video-thumb" src="/api/thumbnail?vid=${id}" alt="" loading="lazy">
-        <div class="video-item-info">
-          <div class="video-item-name" title="${v.filename}">${v.filename}</div>
-          <div class="video-item-meta">${v.width}×${v.height} · ${formatTime(v.duration)}</div>
-        </div>
-        <button class="video-item-remove" onclick="removeVideo(${id}, event)" title="移除">✕</button>
-      </div>`;
+    const numericId = Number(id);
+    const isActive = numericId === activeId;
+
+    const item = document.createElement('div');
+    item.className = `video-item ${isActive ? 'active' : ''}`;
+    item.addEventListener('click', () => selectVideo(numericId));
+
+    const thumb = document.createElement('img');
+    thumb.className = 'video-thumb';
+    thumb.src = `/api/thumbnail?vid=${numericId}`;
+    thumb.alt = '';
+    thumb.loading = 'lazy';
+
+    const info = document.createElement('div');
+    info.className = 'video-item-info';
+
+    const name = document.createElement('div');
+    name.className = 'video-item-name';
+    name.title = v.filename;
+    name.textContent = v.filename;
+
+    const meta = document.createElement('div');
+    meta.className = 'video-item-meta';
+    meta.textContent = `${v.width}×${v.height} · ${formatTime(v.duration)}`;
+
+    info.appendChild(name);
+    info.appendChild(meta);
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'video-item-remove';
+    removeBtn.title = '移除';
+    removeBtn.textContent = '✕';
+    removeBtn.addEventListener('click', e => removeVideo(numericId, e));
+
+    item.appendChild(thumb);
+    item.appendChild(info);
+    item.appendChild(removeBtn);
+    list.appendChild(item);
   }
-  list.innerHTML = html;
   list.appendChild(empty);
 }
 
 // ── Timeline ───────────────────────────────────
-function seekTo(t) {
+function seekTo(t, options = {}) {
   const v = activeVideo();
   if (!v) return;
+  if (isPlaying && !options.fromPlayback) {
+    pausePlayback();
+  }
   t = Math.max(0, Math.min(t, v.duration));
   currentTime = t;
 
@@ -757,20 +925,65 @@ function seekTo(t) {
   $('timeCurrent').textContent = formatTime(t);
   $('infoTimecode').textContent = formatTime(t);
 
-  // Cancel any pending frame load
   clearTimeout(seekDebounce);
-  const loadId = ++frameLoadId;
+  if (!options.fromPlayback) {
+    deferredPlaybackTime = null;
+  }
+
+  const plan = getPreviewRequestPlan({
+    isDragging,
+    isPlaying: !!options.fromPlayback,
+    hasPendingLoad: !!pendingFrameLoad,
+  });
+
+  if (plan.defer) {
+    deferredPlaybackTime = t;
+    return;
+  }
+
+  if (plan.abortPending && pendingFrameLoad) {
+    pendingFrameLoad.abort();
+    pendingFrameLoad = null;
+  }
 
   seekDebounce = setTimeout(() => {
+    const loadId = ++frameLoadId;
+    const controller = new AbortController();
+    pendingFrameLoad = controller;
     const url = `/api/frame?vid=${activeId}&t=${t.toFixed(3)}&_=${loadId}`;
-    const tmp = new Image();
-    tmp.onload = () => {
-      if (loadId !== frameLoadId) return; // stale
-      previewImg.src = tmp.src;
-      previewImg.classList.add('loaded');
-    };
-    tmp.src = url;
-  }, isDragging ? 100 : 30); // longer debounce while scrubbing
+    fetch(url, { signal: controller.signal })
+      .then(res => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.blob();
+      })
+      .then(blob => {
+        if (controller.signal.aborted || loadId !== frameLoadId) return;
+        const previewUrl = URL.createObjectURL(blob);
+        revokePreviewUrl();
+        currentPreviewUrl = previewUrl;
+        previewImg.onload = () => {
+          if (loadId === frameLoadId) {
+            previewImg.classList.add('loaded');
+          }
+        };
+        previewImg.src = previewUrl;
+      })
+      .catch(err => {
+        if (err.name !== 'AbortError' && loadId === frameLoadId) {
+          console.error('Frame preview failed:', err);
+        }
+      })
+      .finally(() => {
+        if (pendingFrameLoad === controller) {
+          pendingFrameLoad = null;
+        }
+        if (deferredPlaybackTime !== null) {
+          const nextPlaybackTime = deferredPlaybackTime;
+          deferredPlaybackTime = null;
+          seekTo(nextPlaybackTime, { fromPlayback: true });
+        }
+      });
+  }, plan.debounceMs); // longer debounce while scrubbing
 }
 
 function stepFrame(dir) {
@@ -859,14 +1072,12 @@ function showToast(msg, isError) {
 document.addEventListener('keydown', e => {
   if (e.key === 'ArrowLeft') { e.preventDefault(); stepFrame(-1); }
   if (e.key === 'ArrowRight') { e.preventDefault(); stepFrame(1); }
-  if (e.key === ' ') { e.preventDefault(); grabFrame(); }
+  if (e.key === ' ') { e.preventDefault(); togglePlayback(); }
+  if (e.key === 'Enter') { e.preventDefault(); grabFrame(); }
   if ((e.metaKey || e.ctrlKey) && e.key === 'o') { e.preventDefault(); chooseFile(); }
 });
 
 // ── Drag & Drop ────────────────────────────────
-// Strategy: try to resolve file paths first (fast, no upload needed).
-// Fall back to upload only if resolve fails.
-
 function hasVideoFiles(dt) {
   return dt.types.includes('Files');
 }
@@ -920,46 +1131,48 @@ document.addEventListener('drop', async e => {
     return;
   }
 
-  // Use Spotlight (mdfind) to resolve real file paths — no upload, no copy
-  const names = videoFiles.map(f => f.name);
-  const sizes = videoFiles.map(f => f.size);
-  showProgress(`正在定位文件...`, 30);
+  showProgress(`正在导入 ${videoFiles.length} 个视频...`, 30);
+  const formData = new FormData();
+  for (const file of videoFiles) {
+    formData.append('files', file, file.name);
+  }
 
   try {
-    const res = await fetch('/api/resolve_paths', {
+    const res = await fetch('/api/upload', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ names, sizes })
+      body: formData
     });
     const data = await res.json();
+    hideProgress();
 
-    if (data.paths && data.paths.length > 0) {
-      hideProgress();
-      await addVideosByPath(data.paths);
+    if (data.error) {
+      showToast(data.error, true);
       return;
     }
-  } catch (err) { /* fall through */ }
 
-  // Fallback: ask user to pick files via native dialog (no upload needed)
-  hideProgress();
-  showToast('无法自动定位文件，请手动选择', false);
-
-  try {
-    const res = await fetch('/api/choose_for_drop', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ count: videoFiles.length })
-    });
-    const data = await res.json();
-    if (data.paths && data.paths.length > 0) {
-      await addVideosByPath(data.paths);
+    if (data.added && data.added.length > 0) {
+      for (const v of data.added) {
+        videos[String(v.id)] = v;
+      }
+      const selectId = data.active !== null ? data.active : data.added[0].id;
+      await selectVideo(selectId);
+      renderVideoList();
+      showToast(`已添加 ${data.added.length} 个视频`);
+    } else {
+      showToast('没有可导入的视频', true);
     }
   } catch (err) {
-    showToast('导入失败', true);
+    hideProgress();
+    showToast('导入失败: ' + err.message, true);
   }
 });
 
 // ── Init ───────────────────────────────────────
+startHeartbeat();
+window.addEventListener('beforeunload', () => {
+  pingApp();
+});
+
 fetch('/api/state').then(r => r.json()).then(d => {
   $('saveDir').textContent = d.save_dir_name || '桌面';
 });
