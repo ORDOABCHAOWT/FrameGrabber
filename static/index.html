@@ -122,13 +122,16 @@ body::after {
   background: rgba(0,0,0,0.3);
 }
 
-.preview-area img {
-  max-width: 100%; max-height: 100%;
+.preview-media {
+  position: absolute; inset: 0;
+  width: 100%; height: 100%;
   object-fit: contain; opacity: 0;
   transition: opacity 0.15s;
+  pointer-events: none;
 }
 
-.preview-area img.loaded { opacity: 1; }
+.preview-media.visible { opacity: 1; }
+.preview-area img.preview-media.visible.loaded { opacity: 1; }
 
 .drop-zone {
   position: absolute; inset: 0;
@@ -415,7 +418,10 @@ body::after {
 
 .timeline-track:hover .timeline-hover-preview { opacity: 1; }
 
-.controls-row { display: flex; align-items: center; justify-content: space-between; }
+.controls-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px; flex-wrap: wrap;
+}
 
 .time-display { display: flex; align-items: baseline; gap: 6px; font-variant-numeric: tabular-nums; }
 .time-current { font-size: 20px; font-weight: 600; letter-spacing: -0.5px; }
@@ -425,6 +431,39 @@ body::after {
 .transport-controls {
   display: flex; align-items: center; gap: 10px;
   margin-left: 18px; flex: 1;
+}
+
+.exposure-controls {
+  display: flex; align-items: center; gap: 10px;
+  padding: 6px 12px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--surface);
+  min-width: 280px;
+}
+
+.exposure-label {
+  font-size: 11px; color: var(--text-muted);
+  text-transform: uppercase; letter-spacing: 0.7px;
+}
+
+.exposure-slider {
+  flex: 1;
+  accent-color: var(--accent);
+}
+
+.exposure-value {
+  font-size: 12px; min-width: 36px;
+  color: var(--text); font-variant-numeric: tabular-nums;
+}
+
+.exposure-reset {
+  border: 1px solid var(--border-light);
+  background: transparent; color: var(--text-dim);
+  border-radius: 999px; padding: 4px 10px;
+  font-size: 11px; cursor: pointer; font-family: inherit;
+}
+
+.exposure-reset:hover {
+  border-color: var(--accent); color: var(--text);
 }
 
 .transport-btn {
@@ -485,7 +524,8 @@ body::after {
       <div class="drop-sub">支持 MP4 / MOV / MKV / AVI / WebM / ProRes</div>
       <button class="drop-btn" onclick="chooseFile()">打开视频</button>
     </div>
-    <img id="previewImg" src="" alt="">
+    <video id="previewVideo" class="preview-media" playsinline muted preload="metadata"></video>
+    <img id="previewImg" class="preview-media" src="" alt="">
     <div class="drag-overlay" id="dragOverlay">
       <div class="drag-overlay-content">
         <div class="drag-overlay-icon">+</div>
@@ -573,6 +613,12 @@ body::after {
         <button class="transport-btn" id="playBtn" onclick="togglePlayback()" disabled>播放预览</button>
         <span class="play-status" id="playStatus">未载入</span>
       </div>
+      <div class="exposure-controls">
+        <span class="exposure-label">曝光</span>
+        <input class="exposure-slider" id="exposureSlider" type="range" min="-1" max="1" step="0.1" value="0">
+        <span class="exposure-value" id="exposureValue">0.0</span>
+        <button class="exposure-reset" id="exposureReset" type="button" onclick="resetExposure()">重置</button>
+      </div>
       <div class="shortcuts">
         <span><span class="shortcut-key">←</span><span class="shortcut-key">→</span> 逐帧</span>
         <span><span class="shortcut-key">Space</span> 播放/暂停</span>
@@ -599,21 +645,22 @@ let frameLoadId = 0;         // monotonic id to discard stale responses
 let currentPreviewUrl = null;
 let heartbeatTimer = null;
 let isPlaying = false;
-let playbackTimer = null;
-let playbackStartedAt = 0;
-let playbackBaseTime = 0;
-const PLAYBACK_INTERVAL_MS = 100;
 let deferredPlaybackTime = null;
+let playbackAnimationFrame = null;
+let currentVideoSourceId = null;
+let exposureValue = 0;
+let previewVideoSourceError = false;
 
 const $ = id => document.getElementById(id);
 const previewImg = $('previewImg');
+const previewVideo = $('previewVideo');
 const dropZone = $('dropZone');
 const dragOverlay = $('dragOverlay');
 const timeline = $('timeline');
 const timelineFill = $('timelineFill');
 const timelineThumb = $('timelineThumb');
 const timelineHover = $('timelineHover');
-const { getPreviewRequestPlan } = window.FrameGrabberPlaybackScheduler;
+const { getPreviewRequestPlan, getVideoSelectionPlan } = window.FrameGrabberPlaybackScheduler;
 
 function formatTime(sec) {
   const h = Math.floor(sec / 3600);
@@ -625,6 +672,113 @@ function formatTime(sec) {
 
 function activeVideo() {
   return activeId !== null ? videos[String(activeId)] : null;
+}
+
+function clampTime(t, v = activeVideo()) {
+  if (!v) return 0;
+  return Math.max(0, Math.min(t, v.duration));
+}
+
+function updateTimelineUI(t) {
+  const v = activeVideo();
+  currentTime = clampTime(t, v);
+  const pct = v && v.duration > 0 ? (currentTime / v.duration) * 100 : 0;
+  timelineFill.style.width = pct + '%';
+  timelineThumb.style.left = pct + '%';
+  $('timeCurrent').textContent = formatTime(currentTime);
+  $('infoTimecode').textContent = formatTime(currentTime);
+}
+
+function formatExposure(value) {
+  return value > 0 ? `+${value.toFixed(1)}` : value.toFixed(1);
+}
+
+function getPreviewBrightness() {
+  return Math.max(0.35, 1 + exposureValue * 0.45);
+}
+
+function applyPreviewExposure() {
+  const filter = `brightness(${getPreviewBrightness().toFixed(3)})`;
+  previewImg.style.filter = filter;
+  previewVideo.style.filter = filter;
+  $('exposureSlider').value = exposureValue.toFixed(1);
+  $('exposureValue').textContent = formatExposure(exposureValue);
+}
+
+function setExposure(nextValue, { refreshPausedPreview = true } = {}) {
+  const parsed = Number.parseFloat(nextValue);
+  exposureValue = Number.isFinite(parsed) ? Math.max(-1, Math.min(1, parsed)) : 0;
+  applyPreviewExposure();
+  if (refreshPausedPreview && activeVideo() && !isPlaying) {
+    seekTo(currentTime, { skipPause: true });
+  }
+}
+
+function resetExposure() {
+  setExposure(0);
+}
+
+function showVideoPreview() {
+  previewVideo.classList.add('visible');
+  previewImg.classList.remove('visible');
+  previewImg.classList.remove('loaded');
+}
+
+function showImagePreview() {
+  previewVideo.classList.remove('visible');
+  if (previewImg.src) {
+    previewImg.classList.add('visible');
+  }
+}
+
+function clearPreviewVideoSource() {
+  currentVideoSourceId = null;
+  previewVideoSourceError = false;
+  previewVideo.pause();
+  previewVideo.removeAttribute('src');
+  previewVideo.load();
+}
+
+function ensurePreviewVideoSource(targetId = activeId, { forceReload = false } = {}) {
+  if (targetId === null) return false;
+  const nextSrc = `/api/video?vid=${targetId}`;
+  if (!forceReload && currentVideoSourceId === targetId && previewVideo.getAttribute('src') === nextSrc) {
+    return false;
+  }
+  if (forceReload) {
+    previewVideo.pause();
+    previewVideo.removeAttribute('src');
+    previewVideo.load();
+  }
+  previewVideoSourceError = false;
+  previewVideo.src = nextSrc;
+  currentVideoSourceId = targetId;
+  return true;
+}
+
+async function primePreviewVideo() {
+  ensurePreviewVideoSource(activeId, { forceReload: previewVideoSourceError });
+  if (previewVideo.readyState < 1) {
+    await new Promise((resolve, reject) => {
+      const onLoaded = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error('视频载入失败'));
+      };
+      const cleanup = () => {
+        previewVideo.removeEventListener('loadedmetadata', onLoaded);
+        previewVideo.removeEventListener('error', onError);
+      };
+
+      previewVideo.addEventListener('loadedmetadata', onLoaded, { once: true });
+      previewVideo.addEventListener('error', onError, { once: true });
+    });
+  }
+
+  previewVideo.currentTime = clampTime(currentTime);
 }
 
 function revokePreviewUrl() {
@@ -659,51 +813,76 @@ function updatePlaybackUI() {
   $('playStatus').textContent = isPlaying ? '播放中' : '已暂停';
 }
 
-function pausePlayback() {
-  if (playbackTimer) {
-    clearInterval(playbackTimer);
-    playbackTimer = null;
+function stopPlaybackSyncLoop() {
+  if (playbackAnimationFrame !== null) {
+    cancelAnimationFrame(playbackAnimationFrame);
+    playbackAnimationFrame = null;
   }
+}
+
+function syncTimelineFromVideo() {
+  if (!isPlaying) return;
+  updateTimelineUI(previewVideo.currentTime);
+  playbackAnimationFrame = requestAnimationFrame(syncTimelineFromVideo);
+}
+
+function pausePlayback({ syncFrame = true, targetTime = null } = {}) {
+  if (!activeVideo()) return;
+  if (!previewVideo.paused) {
+    previewVideo.pause();
+  }
+  stopPlaybackSyncLoop();
   isPlaying = false;
   deferredPlaybackTime = null;
   updatePlaybackUI();
+
+  if (!syncFrame) return;
+
+  const pauseTime = clampTime(
+    targetTime !== null ? targetTime : previewVideo.currentTime,
+    activeVideo()
+  );
+  updateTimelineUI(pauseTime);
+  seekTo(pauseTime, { skipPause: true, swapPreviewAfterLoad: true });
 }
 
-function playbackTick() {
-  const v = activeVideo();
-  if (!v) {
-    pausePlayback();
-    return;
-  }
-
-  const nextTime = playbackBaseTime + ((performance.now() - playbackStartedAt) / 1000);
-  if (nextTime >= v.duration) {
-    pausePlayback();
-    seekTo(v.duration, { fromPlayback: true });
-    return;
-  }
-  seekTo(nextTime, { fromPlayback: true });
-}
-
-function togglePlayback() {
+async function startPlayback() {
   const v = activeVideo();
   if (!v) return;
 
+  if (currentTime >= v.duration) {
+    updateTimelineUI(0);
+  }
+
+  if (pendingFrameLoad) {
+    pendingFrameLoad.abort();
+    pendingFrameLoad = null;
+  }
+  clearTimeout(seekDebounce);
+
+  try {
+    await primePreviewVideo();
+    showVideoPreview();
+    isPlaying = true;
+    updatePlaybackUI();
+    syncTimelineFromVideo();
+    await previewVideo.play();
+  } catch (err) {
+    stopPlaybackSyncLoop();
+    isPlaying = false;
+    updatePlaybackUI();
+    showImagePreview();
+    showToast('播放失败: ' + err.message, true);
+  }
+}
+
+function togglePlayback() {
+  if (!activeVideo()) return;
   if (isPlaying) {
     pausePlayback();
     return;
   }
-
-  if (currentTime >= v.duration) {
-    currentTime = 0;
-  }
-
-  playbackBaseTime = currentTime;
-  playbackStartedAt = performance.now();
-  isPlaying = true;
-  updatePlaybackUI();
-  playbackTick();
-  playbackTimer = setInterval(playbackTick, PLAYBACK_INTERVAL_MS);
+  startPlayback();
 }
 
 // ── Import Progress ────────────────────────────
@@ -779,10 +958,23 @@ async function selectVideo(id) {
   const data = await res.json();
   if (data.error) return;
 
-  pausePlayback();
+  pausePlayback({ syncFrame: false });
   activeId = id;
   const v = videos[String(id)];
-  currentTime = 0;
+  updateTimelineUI(0);
+  previewImg.classList.remove('loaded');
+  previewImg.classList.remove('visible');
+  previewVideo.classList.remove('visible');
+  revokePreviewUrl();
+  previewImg.src = '';
+
+  const selectionPlan = getVideoSelectionPlan({
+    hasPreparedVideoSource: currentVideoSourceId === id,
+    hasVideoSourceError: previewVideoSourceError,
+  });
+  if (selectionPlan.shouldPrimeVideoSource) {
+    ensurePreviewVideoSource(id, { forceReload: selectionPlan.shouldReloadPreparedSource });
+  }
 
   $('fileName').textContent = v.filename;
   $('badgeRes').classList.add('visible');
@@ -803,7 +995,9 @@ async function selectVideo(id) {
 
   dropZone.classList.add('hidden');
   renderVideoList();
-  seekTo(0);
+  if (selectionPlan.shouldLoadStillPreview) {
+    seekTo(0, { skipPause: true });
+  }
 }
 
 async function removeVideo(id, e) {
@@ -817,7 +1011,7 @@ async function removeVideo(id, e) {
   const data = await res.json();
   delete videos[String(id)];
   activeId = data.active;
-  pausePlayback();
+  pausePlayback({ syncFrame: false });
 
   if (activeId !== null) {
     await selectVideo(activeId);
@@ -828,7 +1022,7 @@ async function removeVideo(id, e) {
 }
 
 function resetUI() {
-  pausePlayback();
+  pausePlayback({ syncFrame: false });
   if (pendingFrameLoad) {
     pendingFrameLoad.abort();
     pendingFrameLoad = null;
@@ -842,8 +1036,13 @@ function resetUI() {
   timelineFill.style.width = '0%';
   timelineThumb.style.left = '0%';
   previewImg.classList.remove('loaded');
+  previewImg.classList.remove('visible');
+  previewVideo.classList.remove('visible');
   revokePreviewUrl();
   previewImg.src = '';
+  clearPreviewVideoSource();
+  activeId = null;
+  currentTime = 0;
   $('grabBtn').disabled = true;
   dropZone.classList.remove('hidden');
   updatePlaybackUI();
@@ -912,29 +1111,28 @@ function renderVideoList() {
 function seekTo(t, options = {}) {
   const v = activeVideo();
   if (!v) return;
-  if (isPlaying && !options.fromPlayback) {
-    pausePlayback();
+  if (isPlaying && !options.skipPause) {
+    pausePlayback({ targetTime: t });
+    return;
   }
-  t = Math.max(0, Math.min(t, v.duration));
-  currentTime = t;
-
-  const pct = v.duration > 0 ? (t / v.duration) * 100 : 0;
-  timelineFill.style.width = pct + '%';
-  timelineThumb.style.left = pct + '%';
-
-  $('timeCurrent').textContent = formatTime(t);
-  $('infoTimecode').textContent = formatTime(t);
+  t = clampTime(t, v);
+  updateTimelineUI(t);
 
   clearTimeout(seekDebounce);
-  if (!options.fromPlayback) {
+  if (!options.fromVideoPlayback) {
     deferredPlaybackTime = null;
   }
 
   const plan = getPreviewRequestPlan({
     isDragging,
-    isPlaying: !!options.fromPlayback,
+    isPlaying: !!options.fromVideoPlayback,
     hasPendingLoad: !!pendingFrameLoad,
+    useVideoPlayback: !!options.useVideoPlayback,
   });
+
+  if (!plan.shouldLoadPreview) {
+    return;
+  }
 
   if (plan.defer) {
     deferredPlaybackTime = t;
@@ -950,7 +1148,8 @@ function seekTo(t, options = {}) {
     const loadId = ++frameLoadId;
     const controller = new AbortController();
     pendingFrameLoad = controller;
-    const url = `/api/frame?vid=${activeId}&t=${t.toFixed(3)}&_=${loadId}`;
+    const swapPreviewAfterLoad = !!options.swapPreviewAfterLoad;
+    const url = `/api/frame?vid=${activeId}&t=${t.toFixed(3)}&exposure=${exposureValue.toFixed(3)}&_=${loadId}`;
     fetch(url, { signal: controller.signal })
       .then(res => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -964,9 +1163,17 @@ function seekTo(t, options = {}) {
         previewImg.onload = () => {
           if (loadId === frameLoadId) {
             previewImg.classList.add('loaded');
+            previewImg.classList.add('visible');
+            if (swapPreviewAfterLoad) {
+              showImagePreview();
+            }
           }
         };
+        previewImg.classList.remove('loaded');
         previewImg.src = previewUrl;
+        if (!swapPreviewAfterLoad) {
+          showImagePreview();
+        }
       })
       .catch(err => {
         if (err.name !== 'AbortError' && loadId === frameLoadId) {
@@ -980,7 +1187,7 @@ function seekTo(t, options = {}) {
         if (deferredPlaybackTime !== null) {
           const nextPlaybackTime = deferredPlaybackTime;
           deferredPlaybackTime = null;
-          seekTo(nextPlaybackTime, { fromPlayback: true });
+          seekTo(nextPlaybackTime, { fromVideoPlayback: true });
         }
       });
   }, plan.debounceMs); // longer debounce while scrubbing
@@ -1031,7 +1238,7 @@ async function grabFrame() {
     const res = await fetch('/api/grab', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vid: activeId, time: currentTime })
+      body: JSON.stringify({ vid: activeId, time: currentTime, exposure: exposureValue })
     });
     const data = await res.json();
     if (data.error) {
@@ -1054,6 +1261,29 @@ async function chooseSaveDir() {
   const data = await res.json();
   if (data.dir) $('saveDir').textContent = data.name || data.dir;
 }
+
+previewVideo.addEventListener('timeupdate', () => {
+  if (isPlaying) {
+    updateTimelineUI(previewVideo.currentTime);
+  }
+});
+
+previewVideo.addEventListener('loadedmetadata', () => {
+  previewVideoSourceError = false;
+});
+
+previewVideo.addEventListener('error', () => {
+  previewVideoSourceError = true;
+});
+
+previewVideo.addEventListener('ended', () => {
+  const v = activeVideo();
+  pausePlayback({ targetTime: v ? v.duration : previewVideo.currentTime });
+});
+
+$('exposureSlider').addEventListener('input', e => {
+  setExposure(e.target.value);
+});
 
 // ── Toast ──────────────────────────────────────
 let toastTimer = null;
@@ -1176,6 +1406,7 @@ window.addEventListener('beforeunload', () => {
 fetch('/api/state').then(r => r.json()).then(d => {
   $('saveDir').textContent = d.save_dir_name || '桌面';
 });
+applyPreviewExposure();
 </script>
 </body>
 </html>

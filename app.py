@@ -37,6 +37,8 @@ TEMP_DIR = tempfile.mkdtemp(prefix="framegrabber_")
 UPLOAD_DIR = os.path.join(TEMP_DIR, "uploads")
 STATE_LOCK = threading.RLock()
 FRAME_RENDER_LOCKS = {}
+VIDEO_PREWARM_STARTED = set()
+RUNTIME_WARMUP_STARTED = False
 
 # Frame cache: vid -> {time -> jpeg_bytes}
 FRAME_CACHE = {}
@@ -210,6 +212,144 @@ def infer_video_mimetype(path):
     return mime or "application/octet-stream"
 
 
+def parse_exposure(raw_value):
+    """Parse and clamp exposure input into a small safe adjustment range."""
+    try:
+        exposure = float(raw_value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(-1.0, min(1.0, exposure))
+
+
+def build_video_filter(*, scale=None, exposure=0.0):
+    """Build an ffmpeg video filter chain for preview/capture transforms."""
+    filters = []
+    if scale:
+        filters.append(scale)
+    if abs(exposure) > 0.0001:
+        filters.append(f"exposure=exposure={exposure:.3f}")
+    return ",".join(filters) if filters else None
+
+
+def maybe_cache_frame_bytes(vid, t_key, data):
+    """Store preview bytes in the per-video cache using FIFO eviction."""
+    if data is None:
+        return None
+    with STATE_LOCK:
+        cache = FRAME_CACHE.setdefault(vid, {})
+        existing = cache.get(t_key)
+        if existing is not None:
+            return existing
+        if len(cache) >= CACHE_MAX_PER_VIDEO:
+            oldest = next(iter(cache))
+            del cache[oldest]
+        cache[t_key] = data
+    return data
+
+
+def render_preview_frame_bytes(video_meta, t, exposure):
+    """Render a JPEG preview frame and return its bytes."""
+    preview_fd, preview_path = tempfile.mkstemp(
+        prefix="preview_",
+        suffix=".jpg",
+        dir=TEMP_DIR
+    )
+    os.close(preview_fd)
+    try:
+        command = [
+            "ffmpeg", "-y",
+            "-ss", f"{t:.3f}",
+            "-i", video_meta["path"],
+            "-frames:v", "1",
+            "-q:v", "3",
+            "-threads", "2",
+            preview_path
+        ]
+        vf_filter = build_video_filter(
+            scale="scale='min(1280,iw)':-1",
+            exposure=exposure,
+        )
+        if vf_filter:
+            command[8:8] = ["-vf", vf_filter]
+
+        result = subprocess.run(command, capture_output=True, timeout=10)
+        if result.returncode != 0 or not os.path.exists(preview_path):
+            return None
+
+        with open(preview_path, 'rb') as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(preview_path)
+        except OSError:
+            pass
+
+
+def prewarm_video_preview(vid):
+    """Best-effort warmup for the active video's neutral first-frame preview."""
+    with STATE_LOCK:
+        if vid not in VIDEOS:
+            return False
+        if FRAME_CACHE.get(vid, {}).get("0.000|0.000") is not None:
+            return True
+        video_meta = dict(VIDEOS[vid])
+
+    render_lock = get_frame_render_lock(vid)
+    with render_lock:
+        with STATE_LOCK:
+            if vid not in VIDEOS:
+                return False
+            if FRAME_CACHE.get(vid, {}).get("0.000|0.000") is not None:
+                return True
+            video_meta = dict(VIDEOS[vid])
+
+        data = render_preview_frame_bytes(video_meta, 0.0, 0.0)
+        cached = maybe_cache_frame_bytes(vid, "0.000|0.000", data)
+        return cached is not None
+
+
+def schedule_video_prewarm(vid):
+    """Run per-video warmup once per session without blocking user requests."""
+    with STATE_LOCK:
+        if vid not in VIDEOS or vid in VIDEO_PREWARM_STARTED:
+            return
+        VIDEO_PREWARM_STARTED.add(vid)
+
+    def _run():
+        warmed = False
+        try:
+            warmed = prewarm_video_preview(vid)
+        finally:
+            if not warmed:
+                with STATE_LOCK:
+                    VIDEO_PREWARM_STARTED.discard(vid)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def warm_runtime_dependencies():
+    """Prime lightweight runtime dependencies so first real work feels faster."""
+    commands = [
+        ["ffmpeg", "-version"],
+        ["ffprobe", "-version"],
+    ]
+    for command in commands:
+        try:
+            subprocess.run(command, capture_output=True, timeout=5)
+        except Exception:
+            pass
+
+
+def ensure_runtime_warmup():
+    """Start one-time process warmup in the background."""
+    global RUNTIME_WARMUP_STARTED
+    with STATE_LOCK:
+        if RUNTIME_WARMUP_STARTED:
+            return
+        RUNTIME_WARMUP_STARTED = True
+    threading.Thread(target=warm_runtime_dependencies, daemon=True).start()
+
+
 # ── Routes ─────────────────────────────────────────────
 @app.after_request
 def add_no_cache(response):
@@ -254,6 +394,9 @@ def add_video():
             ACTIVE_ID = added[0]["id"]
         active = ACTIVE_ID
 
+    if active is not None:
+        schedule_video_prewarm(active)
+
     return jsonify({"added": added, "active": active})
 
 
@@ -295,6 +438,9 @@ def upload_videos():
             ACTIVE_ID = added[0]["id"]
         active = ACTIVE_ID
 
+    if active is not None:
+        schedule_video_prewarm(active)
+
     return jsonify({"added": added, "active": active})
 
 
@@ -307,7 +453,12 @@ def select_video():
     with STATE_LOCK:
         if vid in VIDEOS:
             ACTIVE_ID = vid
-            return jsonify({"active": vid, "video": VIDEOS[vid]})
+            video = dict(VIDEOS[vid])
+        else:
+            video = None
+    if video is not None:
+        schedule_video_prewarm(vid)
+        return jsonify({"active": vid, "video": video})
     return jsonify({"error": "视频不存在"}), 404
 
 
@@ -322,6 +473,7 @@ def remove_video():
             del VIDEOS[vid]
             FRAME_CACHE.pop(vid, None)
             FRAME_RENDER_LOCKS.pop(vid, None)
+            VIDEO_PREWARM_STARTED.discard(vid)
             if ACTIVE_ID == vid:
                 ACTIVE_ID = next(iter(VIDEOS), None)
             return jsonify({"active": ACTIVE_ID})
@@ -431,8 +583,9 @@ def get_frame():
         t = float(request.args.get("t", "0"))
     except (TypeError, ValueError):
         return "Invalid request", 400
+    exposure = parse_exposure(request.args.get("exposure", "0"))
 
-    t_key = f"{t:.3f}"
+    t_key = f"{t:.3f}|{exposure:.3f}"
     with STATE_LOCK:
         if vid is None:
             vid = ACTIVE_ID
@@ -453,46 +606,12 @@ def get_frame():
             cached_frame = FRAME_CACHE.get(vid, {}).get(t_key)
             if cached_frame is not None:
                 return cached_frame, 200, {'Content-Type': 'image/jpeg'}
+        data = render_preview_frame_bytes(v, t, exposure)
+        if data is None:
+            return "FFmpeg error", 500
 
-        preview_fd, preview_path = tempfile.mkstemp(
-            prefix=f"preview_{vid}_",
-            suffix=".jpg",
-            dir=TEMP_DIR
-        )
-        os.close(preview_fd)
-        try:
-            result = subprocess.run([
-                "ffmpeg", "-y",
-                "-ss", f"{t:.3f}",
-                "-i", v["path"],
-                "-frames:v", "1",
-                "-vf", "scale='min(1280,iw)':-1",
-                "-q:v", "3",
-                "-threads", "2",
-                preview_path
-            ], capture_output=True, timeout=10)
-            if result.returncode != 0 or not os.path.exists(preview_path):
-                return "FFmpeg error", 500
-
-            with open(preview_path, 'rb') as f:
-                data = f.read()
-
-            with STATE_LOCK:
-                cache = FRAME_CACHE.setdefault(vid, {})
-                existing = cache.get(t_key)
-                if existing is not None:
-                    data = existing
-                else:
-                    if len(cache) >= CACHE_MAX_PER_VIDEO:
-                        oldest = next(iter(cache))
-                        del cache[oldest]
-                    cache[t_key] = data
-            return data, 200, {'Content-Type': 'image/jpeg'}
-        finally:
-            try:
-                os.remove(preview_path)
-            except OSError:
-                pass
+        cached_data = maybe_cache_frame_bytes(vid, t_key, data)
+        return cached_data, 200, {'Content-Type': 'image/jpeg'}
 
 
 @app.route("/api/thumbnail")
@@ -560,6 +679,7 @@ def grab_frame():
         v = dict(VIDEOS[vid])
         save_dir = SAVE_DIR
     t = float(data.get("time", 0))
+    exposure = parse_exposure(data.get("exposure", 0))
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     h = int(t // 3600)
@@ -573,13 +693,18 @@ def grab_frame():
     output_path = os.path.join(save_dir, filename)
 
     try:
-        result = subprocess.run([
+        command = [
             "ffmpeg", "-y", "-ss", f"{t:.3f}",
             "-i", v["path"],
             "-frames:v", "1",
             "-compression_level", "3",
             output_path
-        ], capture_output=True, text=True, timeout=30)
+        ]
+        vf_filter = build_video_filter(exposure=exposure)
+        if vf_filter:
+            command[8:8] = ["-vf", vf_filter]
+
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
 
         if result.returncode != 0:
             return jsonify({"error": "截取失败"}), 500
@@ -664,12 +789,33 @@ def _pick_port(preferred_port):
             return sock.getsockname()[1]
 
 
+def wait_for_local_server(host, port, timeout=5.0, poll_interval=0.05):
+    """Poll until the local HTTP server is actually accepting connections."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=poll_interval):
+                return True
+        except OSError:
+            time.sleep(poll_interval)
+    return False
+
+
+def open_browser_when_ready(port, timeout=5.0, poll_interval=0.05):
+    """Open the UI only after the local server is listening."""
+    if wait_for_local_server("127.0.0.1", port, timeout=timeout, poll_interval=poll_interval):
+        webbrowser.open(f"http://localhost:{port}")
+        return True
+    return False
+
+
 def main():
     started_at = time.time()
     port = _pick_port(9973)
     print(f"\n  FrameGrabber 启动中...")
     print(f"  http://localhost:{port}\n")
-    webbrowser.open(f"http://localhost:{port}")
+    ensure_runtime_warmup()
+    threading.Thread(target=open_browser_when_ready, args=(port,), daemon=True).start()
     threading.Thread(target=_idle_shutdown_watchdog, args=(started_at,), daemon=True).start()
 
     try:
