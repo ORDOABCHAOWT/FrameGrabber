@@ -42,10 +42,10 @@ RUNTIME_WARMUP_STARTED = False
 
 # Frame cache: vid -> {time -> jpeg_bytes}
 FRAME_CACHE = {}
-CACHE_MAX_PER_VIDEO = 30
+CACHE_MAX_PER_VIDEO = 80
 CLIENT_PING_LOCK = threading.RLock()
 LAST_CLIENT_PING = 0.0
-CLIENT_IDLE_TIMEOUT = 4.0
+CLIENT_IDLE_TIMEOUT = 10.0
 STARTUP_GRACE_PERIOD = 15.0
 VIDEO_EXTENSIONS = {
     ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".flv",
@@ -212,22 +212,11 @@ def infer_video_mimetype(path):
     return mime or "application/octet-stream"
 
 
-def parse_exposure(raw_value):
-    """Parse and clamp exposure input into a small safe adjustment range."""
-    try:
-        exposure = float(raw_value)
-    except (TypeError, ValueError):
-        return 0.0
-    return max(-1.0, min(1.0, exposure))
-
-
-def build_video_filter(*, scale=None, exposure=0.0):
+def build_video_filter(*, scale=None):
     """Build an ffmpeg video filter chain for preview/capture transforms."""
     filters = []
     if scale:
         filters.append(scale)
-    if abs(exposure) > 0.0001:
-        filters.append(f"exposure=exposure={exposure:.3f}")
     return ",".join(filters) if filters else None
 
 
@@ -247,7 +236,7 @@ def maybe_cache_frame_bytes(vid, t_key, data):
     return data
 
 
-def render_preview_frame_bytes(video_meta, t, exposure):
+def render_preview_frame_bytes(video_meta, t):
     """Render a JPEG preview frame and return its bytes."""
     preview_fd, preview_path = tempfile.mkstemp(
         prefix="preview_",
@@ -260,17 +249,15 @@ def render_preview_frame_bytes(video_meta, t, exposure):
             "ffmpeg", "-y",
             "-ss", f"{t:.3f}",
             "-i", video_meta["path"],
+            "-an", "-sn",
             "-frames:v", "1",
             "-q:v", "3",
             "-threads", "2",
             preview_path
         ]
-        vf_filter = build_video_filter(
-            scale="scale='min(1280,iw)':-1",
-            exposure=exposure,
-        )
+        vf_filter = build_video_filter(scale="scale='min(1280,iw)':-1")
         if vf_filter:
-            command[8:8] = ["-vf", vf_filter]
+            command[-1:-1] = ["-vf", vf_filter]
 
         result = subprocess.run(command, capture_output=True, timeout=10)
         if result.returncode != 0 or not os.path.exists(preview_path):
@@ -290,7 +277,7 @@ def prewarm_video_preview(vid):
     with STATE_LOCK:
         if vid not in VIDEOS:
             return False
-        if FRAME_CACHE.get(vid, {}).get("0.000|0.000") is not None:
+        if FRAME_CACHE.get(vid, {}).get("0.000") is not None:
             return True
         video_meta = dict(VIDEOS[vid])
 
@@ -299,12 +286,12 @@ def prewarm_video_preview(vid):
         with STATE_LOCK:
             if vid not in VIDEOS:
                 return False
-            if FRAME_CACHE.get(vid, {}).get("0.000|0.000") is not None:
+            if FRAME_CACHE.get(vid, {}).get("0.000") is not None:
                 return True
             video_meta = dict(VIDEOS[vid])
 
-        data = render_preview_frame_bytes(video_meta, 0.0, 0.0)
-        cached = maybe_cache_frame_bytes(vid, "0.000|0.000", data)
+        data = render_preview_frame_bytes(video_meta, 0.0)
+        cached = maybe_cache_frame_bytes(vid, "0.000", data)
         return cached is not None
 
 
@@ -583,9 +570,8 @@ def get_frame():
         t = float(request.args.get("t", "0"))
     except (TypeError, ValueError):
         return "Invalid request", 400
-    exposure = parse_exposure(request.args.get("exposure", "0"))
 
-    t_key = f"{t:.3f}|{exposure:.3f}"
+    t_key = f"{t:.3f}"
     with STATE_LOCK:
         if vid is None:
             vid = ACTIVE_ID
@@ -606,7 +592,7 @@ def get_frame():
             cached_frame = FRAME_CACHE.get(vid, {}).get(t_key)
             if cached_frame is not None:
                 return cached_frame, 200, {'Content-Type': 'image/jpeg'}
-        data = render_preview_frame_bytes(v, t, exposure)
+        data = render_preview_frame_bytes(v, t)
         if data is None:
             return "FFmpeg error", 500
 
@@ -678,8 +664,11 @@ def grab_frame():
             return jsonify({"error": "未选择视频"}), 400
         v = dict(VIDEOS[vid])
         save_dir = SAVE_DIR
-    t = float(data.get("time", 0))
-    exposure = parse_exposure(data.get("exposure", 0))
+    try:
+        t = float(data.get("time", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "时间参数无效"}), 400
+    t = max(0.0, min(t, float(v["duration"])))
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     h = int(t // 3600)
@@ -700,10 +689,6 @@ def grab_frame():
             "-compression_level", "3",
             output_path
         ]
-        vf_filter = build_video_filter(exposure=exposure)
-        if vf_filter:
-            command[8:8] = ["-vf", vf_filter]
-
         result = subprocess.run(command, capture_output=True, text=True, timeout=30)
 
         if result.returncode != 0:

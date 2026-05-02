@@ -41,8 +41,19 @@
     };
   }
 
+  function getCaptureTime({ currentTime, previewVideoTime, isPlaying = false }) {
+    if (isPlaying && Number.isFinite(previewVideoTime)) {
+      return previewVideoTime;
+    }
+    if (Number.isFinite(currentTime)) {
+      return currentTime;
+    }
+    return 0;
+  }
+
   return {
     getPreviewRequestPlan,
     getVideoSelectionPlan,
+    getCaptureTime,
   };
 });

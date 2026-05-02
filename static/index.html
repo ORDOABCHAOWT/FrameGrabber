@@ -650,6 +650,10 @@ let playbackAnimationFrame = null;
 let currentVideoSourceId = null;
 let exposureValue = 0;
 let previewVideoSourceError = false;
+let dragMoveRafId = null;
+let pendingDragEvent = null;
+let scrubPreviewActive = false;
+let scrubSettleTimer = null;
 
 const $ = id => document.getElementById(id);
 const previewImg = $('previewImg');
@@ -660,7 +664,7 @@ const timeline = $('timeline');
 const timelineFill = $('timelineFill');
 const timelineThumb = $('timelineThumb');
 const timelineHover = $('timelineHover');
-const { getPreviewRequestPlan, getVideoSelectionPlan } = window.FrameGrabberPlaybackScheduler;
+const { getPreviewRequestPlan, getVideoSelectionPlan, getCaptureTime } = window.FrameGrabberPlaybackScheduler;
 
 function formatTime(sec) {
   const h = Math.floor(sec / 3600);
@@ -734,6 +738,7 @@ function showImagePreview() {
 function clearPreviewVideoSource() {
   currentVideoSourceId = null;
   previewVideoSourceError = false;
+  scrubPreviewActive = false;
   previewVideo.pause();
   previewVideo.removeAttribute('src');
   previewVideo.load();
@@ -1108,6 +1113,32 @@ function renderVideoList() {
 }
 
 // ── Timeline ───────────────────────────────────
+function tryNativeScrubPreview(t) {
+  if (activeId === null) return false;
+  if (!ensurePreviewVideoSource(activeId, { forceReload: previewVideoSourceError })) {
+    if (previewVideoSourceError) return false;
+  }
+  if (previewVideo.readyState < 1) return false;
+  try {
+    previewVideo.currentTime = clampTime(t);
+  } catch (e) {
+    return false;
+  }
+  if (!scrubPreviewActive) {
+    previewVideo.classList.add('visible');
+    scrubPreviewActive = true;
+  }
+  return true;
+}
+
+function endScrubPreview() {
+  if (!scrubPreviewActive) return;
+  scrubPreviewActive = false;
+  if (previewImg.src && previewImg.classList.contains('loaded')) {
+    previewVideo.classList.remove('visible');
+  }
+}
+
 function seekTo(t, options = {}) {
   const v = activeVideo();
   if (!v) return;
@@ -1121,6 +1152,19 @@ function seekTo(t, options = {}) {
   clearTimeout(seekDebounce);
   if (!options.fromVideoPlayback) {
     deferredPlaybackTime = null;
+  }
+
+  // While the user is actively dragging the timeline, skip the server round-trip
+  // and let the <video> element show a fast, decoder-driven preview. The
+  // high-quality frame is requested once after the scrub settles.
+  if (isDragging && !options.fromVideoPlayback) {
+    if (tryNativeScrubPreview(t)) {
+      if (pendingFrameLoad) {
+        pendingFrameLoad.abort();
+        pendingFrameLoad = null;
+      }
+      return;
+    }
   }
 
   const plan = getPreviewRequestPlan({
@@ -1149,7 +1193,7 @@ function seekTo(t, options = {}) {
     const controller = new AbortController();
     pendingFrameLoad = controller;
     const swapPreviewAfterLoad = !!options.swapPreviewAfterLoad;
-    const url = `/api/frame?vid=${activeId}&t=${t.toFixed(3)}&exposure=${exposureValue.toFixed(3)}&_=${loadId}`;
+    const url = `/api/frame?vid=${activeId}&t=${t.toFixed(3)}&_=${loadId}`;
     fetch(url, { signal: controller.signal })
       .then(res => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1158,7 +1202,7 @@ function seekTo(t, options = {}) {
       .then(blob => {
         if (controller.signal.aborted || loadId !== frameLoadId) return;
         const previewUrl = URL.createObjectURL(blob);
-        revokePreviewUrl();
+        const previousUrl = currentPreviewUrl;
         currentPreviewUrl = previewUrl;
         previewImg.onload = () => {
           if (loadId === frameLoadId) {
@@ -1167,11 +1211,12 @@ function seekTo(t, options = {}) {
             if (swapPreviewAfterLoad) {
               showImagePreview();
             }
+            endScrubPreview();
           }
+          if (previousUrl) URL.revokeObjectURL(previousUrl);
         };
-        previewImg.classList.remove('loaded');
         previewImg.src = previewUrl;
-        if (!swapPreviewAfterLoad) {
+        if (!swapPreviewAfterLoad && !scrubPreviewActive) {
           showImagePreview();
         }
       })
@@ -1209,10 +1254,17 @@ function getTimeFromEvent(e) {
 timeline.addEventListener('mousedown', e => {
   if (!activeVideo()) return;
   isDragging = true;
+  // Prime the <video> source immediately so native scrub works on the first move.
+  ensurePreviewVideoSource(activeId, { forceReload: previewVideoSourceError });
   seekTo(getTimeFromEvent(e));
 });
 
-document.addEventListener('mousemove', e => {
+function flushDragMove() {
+  dragMoveRafId = null;
+  const e = pendingDragEvent;
+  pendingDragEvent = null;
+  if (!e) return;
+
   if (isDragging && activeVideo()) {
     seekTo(getTimeFromEvent(e));
   }
@@ -1224,9 +1276,26 @@ document.addEventListener('mousemove', e => {
       timelineHover.style.left = x + 'px';
     }
   }
+}
+
+document.addEventListener('mousemove', e => {
+  pendingDragEvent = e;
+  if (dragMoveRafId === null) {
+    dragMoveRafId = requestAnimationFrame(flushDragMove);
+  }
 });
 
-document.addEventListener('mouseup', () => { isDragging = false; });
+document.addEventListener('mouseup', () => {
+  if (!isDragging) return;
+  isDragging = false;
+  // Request one high-quality still frame to replace the <video> scrub preview.
+  clearTimeout(scrubSettleTimer);
+  scrubSettleTimer = setTimeout(() => {
+    if (activeVideo() && !isPlaying) {
+      seekTo(currentTime, { skipPause: true });
+    }
+  }, 60);
+});
 
 // ── Grab ───────────────────────────────────────
 async function grabFrame() {
@@ -1235,10 +1304,15 @@ async function grabFrame() {
   $('grabBtn').textContent = '截取中...';
 
   try {
+    const captureTime = getCaptureTime({
+      currentTime,
+      previewVideoTime: previewVideo.currentTime,
+      isPlaying,
+    });
     const res = await fetch('/api/grab', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ vid: activeId, time: currentTime, exposure: exposureValue })
+      body: JSON.stringify({ vid: activeId, time: captureTime })
     });
     const data = await res.json();
     if (data.error) {

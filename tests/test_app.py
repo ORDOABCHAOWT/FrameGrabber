@@ -136,7 +136,7 @@ class FrameGrabberAppTests(unittest.TestCase):
             framegrabber.schedule_video_prewarm(1)
             framegrabber.schedule_video_prewarm(1)
 
-        self.assertEqual(framegrabber.FRAME_CACHE[1]["0.000|0.000"], b"warm-jpeg")
+        self.assertEqual(framegrabber.FRAME_CACHE[1]["0.000"], b"warm-jpeg")
         render_mock.assert_called_once()
 
     def test_schedule_video_prewarm_retries_after_failed_warmup(self):
@@ -163,10 +163,13 @@ class FrameGrabberAppTests(unittest.TestCase):
             framegrabber.schedule_video_prewarm(1)
             framegrabber.schedule_video_prewarm(1)
 
-        self.assertEqual(framegrabber.FRAME_CACHE[1]["0.000|0.000"], b"warm-jpeg")
+        self.assertEqual(framegrabber.FRAME_CACHE[1]["0.000"], b"warm-jpeg")
         self.assertEqual(render_mock.call_count, 2)
 
-    def test_frame_endpoint_passes_exposure_filter_to_ffmpeg(self):
+    def test_frame_endpoint_ignores_exposure_param_now_handled_by_frontend(self):
+        """Exposure is applied via CSS filter in the browser, so the backend
+        should produce identical frames regardless of the exposure query param
+        (and cache them under a single key)."""
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
             handle.write(b"video-bytes")
             temp_path = handle.name
@@ -178,8 +181,10 @@ class FrameGrabberAppTests(unittest.TestCase):
             return fd, preview_path
 
         def fake_run(cmd, capture_output=True, timeout=10):
-            vf_index = cmd.index("-vf") + 1
-            self.assertIn("exposure=exposure=0.400", cmd[vf_index])
+            # ffmpeg command must not contain any exposure filter now.
+            if "-vf" in cmd:
+                vf_index = cmd.index("-vf") + 1
+                self.assertNotIn("exposure", cmd[vf_index])
             with open(preview_path, "wb") as fh:
                 fh.write(b"jpeg-bytes")
             return type("Proc", (), {"returncode": 0})()
@@ -197,31 +202,31 @@ class FrameGrabberAppTests(unittest.TestCase):
             framegrabber.ACTIVE_ID = 1
 
             with patch.object(framegrabber.tempfile, "mkstemp", side_effect=fake_mkstemp), \
-                 patch.object(framegrabber.subprocess, "run", side_effect=fake_run):
-                response = self.client.get("/api/frame?vid=1&t=0.500&exposure=0.4")
+                 patch.object(framegrabber.subprocess, "run", side_effect=fake_run) as run_mock:
+                # Even if the old client still sends &exposure=..., the server
+                # should ignore it and serve the same cached bytes.
+                first = self.client.get("/api/frame?vid=1&t=0.500&exposure=0.4")
+                second = self.client.get("/api/frame?vid=1&t=0.500&exposure=0.9")
 
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.data, b"jpeg-bytes")
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(first.data, b"jpeg-bytes")
+            self.assertEqual(second.data, b"jpeg-bytes")
+            # Only one ffmpeg render — the second call should hit the cache.
+            self.assertEqual(run_mock.call_count, 1)
+            self.assertIn("0.500", framegrabber.FRAME_CACHE[1])
         finally:
             if os.path.exists(preview_path):
                 os.remove(preview_path)
             os.remove(temp_path)
 
-    def test_frame_cache_key_changes_with_exposure(self):
+    def test_grab_endpoint_rejects_invalid_time_payload(self):
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
             handle.write(b"video-bytes")
             temp_path = handle.name
 
-        preview_path = os.path.join(framegrabber.TEMP_DIR, "preview-exposure-test.jpg")
-
-        def fake_mkstemp(prefix, suffix, dir):
-            fd = os.open(preview_path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o600)
-            return fd, preview_path
-
-        def fake_run(cmd, capture_output=True, timeout=10):
-            with open(preview_path, "wb") as fh:
-                fh.write(b"adjusted")
-            return type("Proc", (), {"returncode": 0})()
+        save_dir = tempfile.mkdtemp()
+        original_save_dir = framegrabber.SAVE_DIR
 
         try:
             framegrabber.VIDEOS[1] = {
@@ -234,22 +239,24 @@ class FrameGrabberAppTests(unittest.TestCase):
                 "codec": "h264",
             }
             framegrabber.ACTIVE_ID = 1
-            framegrabber.FRAME_CACHE[1] = {"0.500|0.000": b"plain"}
+            with framegrabber.STATE_LOCK:
+                framegrabber.SAVE_DIR = save_dir
 
-            with patch.object(framegrabber.tempfile, "mkstemp", side_effect=fake_mkstemp), \
-                 patch.object(framegrabber.subprocess, "run", side_effect=fake_run):
-                response = self.client.get("/api/frame?vid=1&t=0.500&exposure=0.5")
+            with patch.object(framegrabber.subprocess, "run") as run_mock:
+                response = self.client.post("/api/grab", json={"vid": 1, "time": None})
 
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.data, b"adjusted")
-            self.assertEqual(framegrabber.FRAME_CACHE[1]["0.500|0.000"], b"plain")
-            self.assertEqual(framegrabber.FRAME_CACHE[1]["0.500|0.500"], b"adjusted")
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(response.get_json()["error"], "时间参数无效")
+            run_mock.assert_not_called()
         finally:
-            if os.path.exists(preview_path):
-                os.remove(preview_path)
+            with framegrabber.STATE_LOCK:
+                framegrabber.SAVE_DIR = original_save_dir
+            for name in os.listdir(save_dir):
+                os.remove(os.path.join(save_dir, name))
+            os.rmdir(save_dir)
             os.remove(temp_path)
 
-    def test_grab_endpoint_passes_exposure_filter_to_ffmpeg(self):
+    def test_grab_endpoint_keeps_capture_source_faithful_even_with_preview_exposure(self):
         with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as handle:
             handle.write(b"video-bytes")
             temp_path = handle.name
@@ -258,8 +265,7 @@ class FrameGrabberAppTests(unittest.TestCase):
         original_save_dir = framegrabber.SAVE_DIR
 
         def fake_run(cmd, capture_output=True, text=True, timeout=30):
-            vf_index = cmd.index("-vf") + 1
-            self.assertIn("exposure=exposure=-0.300", cmd[vf_index])
+            self.assertNotIn("-vf", cmd)
             output_path = cmd[-1]
             with open(output_path, "wb") as fh:
                 fh.write(b"png-bytes")
@@ -280,7 +286,7 @@ class FrameGrabberAppTests(unittest.TestCase):
                 framegrabber.SAVE_DIR = save_dir
 
             with patch.object(framegrabber.subprocess, "run", side_effect=fake_run):
-                response = self.client.post("/api/grab", json={"vid": 1, "time": 0.25, "exposure": -0.3})
+                response = self.client.post("/api/grab", json={"vid": 1, "time": 0.25, "exposure": 0.6})
 
             self.assertEqual(response.status_code, 200)
             self.assertIn("filename", response.get_json())
